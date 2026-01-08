@@ -51,7 +51,8 @@ public class BifrostLogUploader {
     public static final String HEADER_AUTHORIZATION = "Authorization";
 
     private final URI bifrostUrl;
-    private final Supplier<String> tokenProvider;
+
+    private final Supplier<String> authHeaderValueProvider;
 
     private static final ContentType PLAIN_UTF8_CONTENT_TYPE = ContentType.create("text/plain", StandardCharsets.UTF_8);
     private final BifrostHttpRequestRetryStrategy retryStrategy;
@@ -63,9 +64,9 @@ public class BifrostLogUploader {
      * @param maxRetries   Number of retries to perform, when then is problem with uploading the logs.
      * @param delaySeconds Number of seconds to increase the waing time each retry. For example 10 means waiting times 10, 20, 30, 40, ...
      */
-    public BifrostLogUploader(URI bifrostUrl, int maxRetries, int delaySeconds, Supplier<String> tokenProvider) {
+    public BifrostLogUploader(URI bifrostUrl, Supplier<String> authHeaderValueProvider, int maxRetries, int delaySeconds) {
         this.bifrostUrl = bifrostUrl.resolve("/final-log/upload");
-        this.tokenProvider = tokenProvider;
+        this.authHeaderValueProvider = authHeaderValueProvider;
         this.retryStrategy = new BifrostHttpRequestRetryStrategy(maxRetries, delaySeconds);
     }
 
@@ -136,7 +137,7 @@ public class BifrostLogUploader {
     private List<Header> prepareHeaders(LogMetadata metadata) {
         List<Header> headers = new ArrayList<>();
         metadata.getHeaders().forEach((k, v) -> headers.add(new BasicHeader(k, v)));
-        headers.add(new BasicHeader(HEADER_AUTHORIZATION, "Bearer " + tokenProvider.get()));
+        headers.add(new BasicHeader(HEADER_AUTHORIZATION, authHeaderValueProvider.get()));
         return headers;
     }
 
