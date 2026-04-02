@@ -17,6 +17,7 @@
  */
 package org.jboss.pnc.bifrost.upload;
 
+import java.io.BufferedInputStream;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -27,6 +28,8 @@ import java.security.NoSuchAlgorithmException;
 public class ChecksumComputingStream extends FilterInputStream {
 
     private final MessageDigest md5;
+
+    public static final int BUFFER_SIZE = 65536; // 64KiB buffer
 
     private ChecksumComputingStream(InputStream stream, MessageDigest md5) {
         super(stream);
@@ -55,8 +58,10 @@ public class ChecksumComputingStream extends FilterInputStream {
     }
 
     public void readFully() throws IOException {
+        final byte[] buffer = new byte[BUFFER_SIZE];
+
         while (true) {
-            if (read() == -1) break;
+            if (read(buffer) == -1) break;
         }
     }
 
