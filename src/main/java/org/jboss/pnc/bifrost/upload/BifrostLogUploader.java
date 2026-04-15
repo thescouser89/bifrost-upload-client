@@ -17,6 +17,7 @@
  */
 package org.jboss.pnc.bifrost.upload;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.hc.client5.http.entity.GzipCompressingEntity;
 import org.apache.hc.client5.http.entity.mime.FileBody;
 import org.apache.hc.client5.http.entity.mime.MultipartEntityBuilder;
@@ -32,6 +33,7 @@ import org.apache.hc.core5.http.ParseException;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.apache.hc.core5.http.io.support.ClassicRequestBuilder;
 import org.apache.hc.core5.http.message.BasicHeader;
+import org.jboss.pnc.api.bifrost.dto.Checksums;
 
 import java.io.ByteArrayInputStream;
 import java.io.File;
@@ -43,19 +45,25 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Supplier;
 
+import static java.lang.String.format;
+
 public class BifrostLogUploader {
     public static final String HEADER_PROCESS_CONTEXT = "log-process-context";
     public static final String HEADER_PROCESS_CONTEXT_VARIANT = "process-context-variant";
     public static final String HEADER_TMP = "log-tmp";
     public static final String HEADER_REQUEST_CONTEXT = "log-request-context";
     public static final String HEADER_AUTHORIZATION = "Authorization";
+    public static final String HEADER_ACCEPTS = "Accept";
 
+    private final URI bifrostUploadUrl;
     private final URI bifrostUrl;
 
     private final Supplier<String> authHeaderValueProvider;
 
     private static final ContentType PLAIN_UTF8_CONTENT_TYPE = ContentType.create("text/plain", StandardCharsets.UTF_8);
     private final BifrostHttpRequestRetryStrategy retryStrategy;
+
+    private static final ObjectMapper objectMapper = new ObjectMapper();
 
     /**
      * Creates a Bifrost log uploader.
@@ -65,7 +73,9 @@ public class BifrostLogUploader {
      * @param delaySeconds Number of seconds to increase the waing time each retry. For example 10 means waiting times 10, 20, 30, 40, ...
      */
     public BifrostLogUploader(URI bifrostUrl, Supplier<String> authHeaderValueProvider, int maxRetries, int delaySeconds) {
-        this.bifrostUrl = bifrostUrl.resolve("/final-log/upload");
+        this.bifrostUrl = bifrostUrl;
+        this.bifrostUploadUrl = bifrostUrl.resolve("/final-log/upload");
+
         this.authHeaderValueProvider = authHeaderValueProvider;
         this.retryStrategy = new BifrostHttpRequestRetryStrategy(maxRetries, delaySeconds);
     }
@@ -117,6 +127,24 @@ public class BifrostLogUploader {
         upload(formDataEntity, headers);
     }
 
+    public Checksums getChecksums(String processContext, TagOption tag) throws BifrostUploadException {
+        return getChecksums(processContext, tag.getTagName());
+    }
+
+    public Checksums getChecksums(String processContext, String tag) throws BifrostUploadException {
+        ClassicHttpRequest request = prepareChecksumRequest(processContext, tag);
+
+        try (CloseableHttpClient httpClient = HttpClientBuilder.create().setRetryStrategy(retryStrategy).build()) {
+            return httpClient.execute(request, (response) -> handleJsonResponse(response, Checksums.class));
+        } catch (IOException e) {
+            throw new BifrostUploadException("Failed to upload log to Bifrost", e);
+        }
+    }
+
+    private URI bifrostChecksumUrl(String processContext, String tag) {
+        return bifrostUrl.resolve(format("/final-log/%s/%s/checksums", processContext, tag));
+    }
+
     private void upload(HttpEntity formDataEntity, List<Header> headers) {
         GzipCompressingEntity gzipped = new GzipCompressingEntity(formDataEntity);
         ClassicHttpRequest request = prepareRequest(gzipped, headers);
@@ -129,8 +157,15 @@ public class BifrostLogUploader {
     }
 
     private ClassicHttpRequest prepareRequest(HttpEntity formDataEntity, List<Header> headers) {
-        ClassicRequestBuilder requestBuilder = ClassicRequestBuilder.post(bifrostUrl).setEntity(formDataEntity);
+        ClassicRequestBuilder requestBuilder = ClassicRequestBuilder.post(bifrostUploadUrl).setEntity(formDataEntity);
         headers.forEach(requestBuilder::addHeader);
+        return requestBuilder.build();
+    }
+
+    private ClassicHttpRequest prepareChecksumRequest(String processContext, String tag) {
+        ClassicRequestBuilder requestBuilder = ClassicRequestBuilder.get(bifrostChecksumUrl(processContext, tag));
+        requestBuilder.addHeader(HEADER_ACCEPTS, ContentType.APPLICATION_JSON.toString());
+
         return requestBuilder.build();
     }
 
@@ -164,4 +199,27 @@ public class BifrostLogUploader {
         }
     }
 
+    private static <T> T handleJsonResponse(ClassicHttpResponse response, Class<T> clazz) {
+        try (HttpEntity entity = response.getEntity()) {
+            if (response.getCode() == 200) {
+
+                return objectMapper.readValue(EntityUtils.toString(entity), clazz);
+            } else if (response.getCode() == 204) {
+
+                throw new BifrostUploadException("Logs missing from Bifrost, status " + response.getCode() + " message: " + response.getReasonPhrase());
+            } else {
+
+                String message;
+                if (entity != null) {
+                    message = EntityUtils.toString(entity);
+                } else {
+                    message = response.getReasonPhrase();
+                }
+
+                throw new BifrostUploadException("Failed to get checksums from Bifrost, status " + response.getCode() + " message: " + message);
+            }
+        } catch (IOException | ParseException e) {
+            throw new BifrostUploadException("Failed to get checksums from Bifrost", e);
+        }
+    }
 }
