@@ -30,6 +30,7 @@ import org.apache.hc.core5.http.ContentType;
 import org.apache.hc.core5.http.Header;
 import org.apache.hc.core5.http.HttpEntity;
 import org.apache.hc.core5.http.ParseException;
+import org.apache.hc.core5.http.io.HttpClientResponseHandler;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.apache.hc.core5.http.io.support.ClassicRequestBuilder;
 import org.apache.hc.core5.http.message.BasicHeader;
@@ -38,6 +39,7 @@ import org.jboss.pnc.api.bifrost.dto.Checksums;
 import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -127,22 +129,67 @@ public class BifrostLogUploader {
         upload(formDataEntity, headers);
     }
 
+    /**
+     * Retrieves checksums from Bifrost given context and tag.
+     */
     public Checksums getChecksums(String processContext, TagOption tag) throws BifrostUploadException {
         return getChecksums(processContext, tag.getTagName());
     }
 
+    /**
+     * Retrieves checksums from Bifrost given context and tag.
+     */
     public Checksums getChecksums(String processContext, String tag) throws BifrostUploadException {
         ClassicHttpRequest request = prepareChecksumRequest(processContext, tag);
 
         try (CloseableHttpClient httpClient = HttpClientBuilder.create().setRetryStrategy(retryStrategy).build()) {
             return httpClient.execute(request, (response) -> handleJsonResponse(response, Checksums.class));
         } catch (IOException e) {
-            throw new BifrostUploadException("Failed to upload log to Bifrost", e);
+            throw new BifrostUploadException("Failed to retrieve checksums from Bifrost", e);
         }
     }
 
-    private URI bifrostChecksumUrl(String processContext, String tag) {
+    /**
+     * Retrieves logs from Bifrost as a InputStream given context and tag.
+     *
+     * The InputStream given in ReadStreamFunction is automatically closed, stream can be read directly.
+     */
+    public <T> T getLogs(String processContext, String tag, ReadStreamFunction<T> readStream) throws BifrostUploadException {
+        return get(processContext, tag, (response -> {
+            try (InputStream inputStream = BifrostLogUploader.handleISResponse(response)) {
+                return readStream.apply(inputStream);
+            }
+        }));
+    }
+
+    /**
+     * Retrieves logs from Bifrost as a String given context and tag.
+     *
+     * Warning, the returned String can consume a lot of memory for huge logs.
+     */
+    public String getStringLogs(String processContext, String tag) throws BifrostUploadException {
+        return get(processContext, tag, BifrostLogUploader::handleStringResponse);
+    }
+
+    /**
+     * Returns URI pointing to upload endpoint.
+     */
+    public URI uploadEndpoint() {
+        return bifrostUploadUrl;
+    }
+
+    /**
+     * Returns URI pointing to checksum endpoint given context and tag.
+     */
+    public URI checksumEndpoint(String processContext, String tag) {
         return bifrostUrl.resolve(format("/final-log/%s/%s/checksums", processContext, tag));
+    }
+
+    /**
+     * Returns URI pointing to log endpoint given context and tag.
+     */
+    public URI getLogEndpoint(String processContext, String tag)  {
+        return bifrostUrl.resolve(format("/final-log/%s/%s", processContext, tag));
     }
 
     private void upload(HttpEntity formDataEntity, List<Header> headers) {
@@ -150,9 +197,19 @@ public class BifrostLogUploader {
         ClassicHttpRequest request = prepareRequest(gzipped, headers);
 
         try (CloseableHttpClient httpclient = HttpClientBuilder.create().setRetryStrategy(retryStrategy).build()) {
-            httpclient.execute(request, BifrostLogUploader::handleResponse);
+            httpclient.execute(request, BifrostLogUploader::handleUploadResponse);
         } catch (IOException e) {
             throw new BifrostUploadException("Failed to upload log to Bifrost", e);
+        }
+    }
+
+    private <T> T get(String processContext, String tag, HttpClientResponseHandler<T> responseHandler) throws BifrostUploadException {
+        ClassicHttpRequest request = prepareGetRequest(processContext, tag);
+
+        try (CloseableHttpClient build = HttpClientBuilder.create().setRetryStrategy(retryStrategy).build()) {
+            return build.execute(request, responseHandler);
+        } catch (IOException e) {
+            throw new BifrostUploadException("Failed to download logs from Bifrost", e);
         }
     }
 
@@ -162,8 +219,15 @@ public class BifrostLogUploader {
         return requestBuilder.build();
     }
 
+    private ClassicHttpRequest prepareGetRequest(String processContext, String tag) {
+        ClassicRequestBuilder requestBuilder = ClassicRequestBuilder.get(getLogEndpoint(processContext, tag));
+        requestBuilder.addHeader(HEADER_ACCEPTS, ContentType.TEXT_PLAIN.toString());
+
+        return requestBuilder.build();
+    }
+
     private ClassicHttpRequest prepareChecksumRequest(String processContext, String tag) {
-        ClassicRequestBuilder requestBuilder = ClassicRequestBuilder.get(bifrostChecksumUrl(processContext, tag));
+        ClassicRequestBuilder requestBuilder = ClassicRequestBuilder.get(checksumEndpoint(processContext, tag));
         requestBuilder.addHeader(HEADER_ACCEPTS, ContentType.APPLICATION_JSON.toString());
 
         return requestBuilder.build();
@@ -185,7 +249,7 @@ public class BifrostLogUploader {
         return multipartEntityBuilder;
     }
 
-    private static boolean handleResponse(ClassicHttpResponse response) {
+    private static boolean handleUploadResponse(ClassicHttpResponse response) {
         try (HttpEntity entity = response.getEntity()) {
             if (response.getCode() == 200) {
                 EntityUtils.consume(entity);
@@ -199,11 +263,23 @@ public class BifrostLogUploader {
         }
     }
 
-    private static <T> T handleJsonResponse(ClassicHttpResponse response, Class<T> clazz) {
-        try (HttpEntity entity = response.getEntity()) {
-            if (response.getCode() == 200) {
+    private static InputStream handleISResponse(ClassicHttpResponse response) {
+        return handleResponse(response, HttpEntity::getContent);
+    }
 
-                return objectMapper.readValue(EntityUtils.toString(entity), clazz);
+    private static String handleStringResponse(ClassicHttpResponse response) {
+        return handleResponse(response, EntityUtils::toString);
+    }
+
+    private static <T> T handleJsonResponse(ClassicHttpResponse response, Class<T> clazz) {
+        return handleResponse(response, (httpEntity) -> objectMapper.readValue(httpEntity.getContent(), clazz));
+    }
+
+    private static <T> T handleResponse(ClassicHttpResponse response, EntityReadFunction<T> entityHandler) {
+        try {
+            HttpEntity entity = response.getEntity();
+            if (response.getCode() == 200) {
+                return entityHandler.apply(entity);
             } else if (response.getCode() == 204) {
 
                 throw new BifrostUploadException("Logs missing from Bifrost, status " + response.getCode() + " message: " + response.getReasonPhrase());
@@ -222,4 +298,15 @@ public class BifrostLogUploader {
             throw new BifrostUploadException("Failed to get checksums from Bifrost", e);
         }
     }
+
+    @FunctionalInterface
+    public interface ReadStreamFunction<T> {
+        T apply(InputStream inputStream) throws IOException;
+    }
+
+    @FunctionalInterface
+    private interface EntityReadFunction<R> {
+        R apply(HttpEntity entity) throws IOException, ParseException;
+    }
+
 }
